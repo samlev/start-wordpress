@@ -1,0 +1,182 @@
+#!/bin/bash
+
+# Settings
+readonly PROJECT_DIRECTORY=~/Desktop/docker
+readonly DOCKER_URL=http://0.0.0.0:8080
+readonly THEME_AUTHOR="Your Name"
+readonly THEME_URL="https://example.com"
+
+# Common Functions
+abort () {
+    if [ ! -z "$2" ]; then echo -e "$2"; fi
+    exit $1
+}
+
+openBrowser() {
+    if which xdg-open > /dev/null; then
+        xdg-open ${DOCKER_URL}
+    elif which gnome-open > /dev/null; then
+        gnome-open ${DOCKER_URL}
+    fi
+}
+
+join_by() {
+    local IFS="$1"
+    shift
+    echo "$*"
+}
+
+stripYadJunk() {
+    echo ${1%?}
+}
+
+# Check capabilities
+readonly REQUIRES=("docker" "docker-compose" "yad" "curl" "unzip")
+
+for i in "${REQUIRES[@]}"
+do
+    if ! type $i > /dev/null; then
+        abort 1 "${i} is not installed! Please install it and try again"
+    fi
+done
+
+####
+#### BEGIN!
+####
+
+cd "${PROJECT_DIRECTORY}"
+
+# Check for already running wordpress containers
+runningContainer=$(docker container ls | grep -oP "([a-f0-9]{12})(?=\s+wordpress)")
+if [ "$runningContainer" != "" ]; then
+    if `yad --text="A wordpress site is already running. Do you want to turn off this site?\n\n If no, the currently running site will be opened instead." --button=gtk-yes:0 --button=gtk-no:1 `; then
+        echo "Shutting down docker container..."
+        docker stop ${runningContainer}
+        # find and kill any DB containers
+        dbContainer=$(docker container ls | grep -oP "([a-f0-9]{12})(?=\s+mariadb)")
+        if [ "$runningContainer" != "" ]; then
+            docker stop ${dbContainer}
+        fi
+    else
+        echo "Opening wordpress site..."
+        openBrowser
+        abort 0
+    fi
+fi
+
+# Find existing projects
+PROJECTS=()
+for FILE in ${PROJECT_DIRECTORY}/*; do
+    [[ -d $FILE ]] && PROJECTS+=("${FILE#${PROJECT_DIRECTORY}/}")
+done
+
+# Ask the user which project to run
+projectList=$(join_by "|" "New Project..." "${PROJECTS[@]}")
+
+projectSelection=$(yad --title="Select project to run..." --form --item-separator="|" --field="Select Project:CB" "${projectList}")
+
+if [ -z "$projectSelection" ]; then
+    abort 1 "No project selected."
+else
+   #strip the trailing separator added by yad
+   projectSelection=$(stripYadJunk "${projectSelection}")
+fi
+
+if [ "$projectSelection" = "New Project..." ]; then
+    newProject=$(yad --title="Project name" --text="What do you want to call this project folder?" --form --field="Project name")
+    if [ "$newProject" != "" ]; then
+        newProject=$(stripYadJunk "${newProject}")
+        newDir="${PROJECT_DIRECTORY}/${newProject}"
+        echo "Getting latest version of WordPress..."
+        wget https://wordpress.org/latest.tar.gz
+        tar -zxf latest.tar.gz
+        mv wordpress/ "${newDir}"
+        rm latest.tar.gz
+        cd "${newDir}"
+        
+        # Ask about making a new theme
+        if `yad --text="Would you like to start a new theme?" --button=gtk-yes:0 --button=gtk-no:1 `; then
+            # Get theme details
+            themeDetails=$(yad --title="Theme" --text="Let's get some theme details" --form --item-separator="|" \
+                               --field="Theme name" --field="Theme slug" --field="Your name" ---field="Your URL" --field="Basic Description" --field="Starter theme?:CB" \
+                               "${newProject}" "${newProject}" "${THEME_AUTHOR}" "${THEME_URL}" "Custom theme for ${newProject}" "underscores|none")
+            IFS='|' read -r -a details <<< "${themeDetails}"
+            
+            # Move to the theme directory
+            cd wp-content/themes
+
+            # Get the starter theme
+            case "${details[5]}" in
+                underscores)
+                    curl -d "underscoresme_generate=1&underscoresme_name=${details[0]}&underscoresme_slug=${details[1]}&underscoresme_author=${details[2]}&underscoresme_author_uri=${details[3]}&underscoresme_description=${details[4]}" -X POST "https://underscores.me" -o theme.zip
+                    unzip theme.zip
+                    rm theme.zip
+                    ;;
+                none)
+                    mkdir ${details[1]}
+                    cd ${details[1]}
+                    cat > style.css <<< "/*
+Theme Name: ${details[0]}
+Theme URI: ${details[3]}
+Description: ${details[4]}
+Author: ${details[2]}
+Version: 1.0
+*/"
+                    cat > index.php <<EOL
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My website</title>
+</head>
+<body>
+    <h2>Content Title</h2>
+    <p>I just built this WordPress theme from scratch!</p>
+</body>
+</html>
+EOL
+            esac
+
+            # Return back to the main site
+            cd "${newDir}"
+        fi
+
+        # Make the config
+        touch docker-compose.yml
+        cat > docker-compose.yml <<EOL
+version: "2"
+services:
+  my-wpdb:
+    image: mariadb
+    ports:
+      - "8081:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ChangeMeIfYouWant
+  my-wp:
+    image: wordpress
+    volumes:
+      - ./:/var/www/html
+    ports:
+      - "8080:80"
+    links:
+      - my-wpdb:mysql
+    environment:
+      WORDPRESS_DB_PASSWORD: ChangeMeIfYouWant
+EOL
+        
+        # Install docker...
+        echo "Installing docker containers... please wait..."
+        docker-compose up -d
+       
+        echo "Done! Opening your new site..."
+        openBrowser
+    else
+        echo "Cannot make a blank project"
+    fi
+else
+    cd "${PROJECT_DIRECTORY}/${projectSelection}"
+    echo "Starting docker..."
+    docker-compose up -d
+    
+    echo "Done! Opening your site..."
+    openBrowser
+fi
